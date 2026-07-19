@@ -1427,6 +1427,216 @@ struct MTPRuntimeFocusedTests {
         #expect(inferred?.perLayerQuantization["language_model.model.embed_tokens"] == nil)
     }
 
+    @Test("JANG hidden anchor overrides stale quantization metadata")
+    func jangHiddenAnchorOverridesStaleQuantizationMetadata() {
+        FocusedMLXTestSupport.withLock {
+            let base = "model.embed_tokens"
+            let weights: [String: MLXArray] = [
+                "\(base).weight": MLXArray.zeros([200_064, 384], dtype: .uint32),
+                "\(base).scales": MLXArray.zeros([200_064, 24], dtype: .float16),
+                "\(base).biases": MLXArray.zeros([200_064, 24], dtype: .float16),
+            ]
+            let stale = BaseConfiguration.PerLayerQuantization(
+                quantization: BaseConfiguration.Quantization(
+                    groupSize: 128, bits: 8, mode: .affine),
+                perLayerQuantization: [
+                    base: .quantize(BaseConfiguration.Quantization(
+                        groupSize: 64, bits: 8, mode: .affine))
+                ])
+
+            let inferred = JangLoader.inferPerLayerQuantization(
+                weights: weights,
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        blockSize: 128,
+                        bitWidthsUsed: [3, 4, 8])),
+                hiddenSizeHint: 3_072,
+                validInDims: [1_536, 3_072],
+                declaredDefaultQuantization: stale.quantization,
+                declaredPerLayerQuantization: stale)
+
+            guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                Issue.record("Expected shape-derived hidden-anchor quantization override")
+                return
+            }
+            #expect(actual.bits == 4)
+            #expect(actual.groupSize == 128)
+        }
+    }
+
+    @Test("JANG vision position embedding preserves valid declared quantization")
+    func jangVisionPositionEmbeddingPreservesDeclaredQuantization() {
+        FocusedMLXTestSupport.withLock {
+            let base = "visual.pos_embed"
+            let weights: [String: MLXArray] = [
+                "\(base).weight": MLXArray.zeros([16, 256], dtype: .uint32),
+                "\(base).scales": MLXArray.zeros([16, 16], dtype: .float16),
+                "\(base).biases": MLXArray.zeros([16, 16], dtype: .float16),
+            ]
+            let declared = BaseConfiguration.PerLayerQuantization(
+                quantization: BaseConfiguration.Quantization(
+                    groupSize: 64, bits: 8, mode: .affine),
+                perLayerQuantization: [
+                    base: .quantize(BaseConfiguration.Quantization(
+                        groupSize: 128, bits: 4, mode: .affine))
+                ])
+
+            let inferred = JangLoader.inferPerLayerQuantization(
+                weights: weights,
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        blockSize: 64,
+                        bitWidthsUsed: [4, 8])),
+                hiddenSizeHint: 3_072,
+                validInDims: [1_024, 2_048, 3_072],
+                declaredDefaultQuantization: declared.quantization,
+                declaredPerLayerQuantization: declared)
+
+            guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                Issue.record("Expected declared vision position-embedding quantization")
+                return
+            }
+            #expect(actual.bits == 4)
+            #expect(actual.groupSize == 128)
+        }
+    }
+
+    @Test("JANG hidden anchor preserves declaration when hidden width is unrealizable")
+    func jangHiddenAnchorPreservesDeclarationWhenHiddenWidthIsUnrealizable() {
+        FocusedMLXTestSupport.withLock {
+            let base = "model.embed_tokens"
+            let weights: [String: MLXArray] = [
+                "\(base).weight": MLXArray.zeros([16, 256], dtype: .uint32),
+                "\(base).scales": MLXArray.zeros([16, 16], dtype: .float16),
+            ]
+            let declared = BaseConfiguration.PerLayerQuantization(
+                quantization: BaseConfiguration.Quantization(
+                    groupSize: 64, bits: 8, mode: .affine),
+                perLayerQuantization: [
+                    base: .quantize(BaseConfiguration.Quantization(
+                        groupSize: 128, bits: 4, mode: .affine))
+                ])
+
+            let inferred = JangLoader.inferPerLayerQuantization(
+                weights: weights,
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        blockSize: 64,
+                        bitWidthsUsed: [4, 8])),
+                hiddenSizeHint: 3_072,
+                validInDims: [2_048, 3_072],
+                declaredDefaultQuantization: declared.quantization,
+                declaredPerLayerQuantization: declared)
+
+            guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                Issue.record("Expected the realizable declaration to be preserved")
+                return
+            }
+            #expect(actual.bits == 4)
+            #expect(actual.groupSize == 128)
+        }
+    }
+
+    @Test("JANG exact manifest precedes hidden-anchor semantics")
+    func jangExactManifestPrecedesHiddenAnchorSemantics() {
+        FocusedMLXTestSupport.withLock {
+            let base = "model.embed_tokens"
+            let weights: [String: MLXArray] = [
+                "\(base).weight": MLXArray.zeros([16, 384], dtype: .uint32),
+                "\(base).scales": MLXArray.zeros([16, 24], dtype: .float16),
+            ]
+            let exact = BaseConfiguration.Quantization(
+                groupSize: 64, bits: 8, mode: .affine)
+
+            let inferred = JangLoader.inferPerLayerQuantization(
+                weights: weights,
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        blockSize: 128,
+                        bitWidthsUsed: [4, 8])),
+                hiddenSizeHint: 3_072,
+                validInDims: [1_536, 3_072],
+                declaredManifestQuantization: [base: exact])
+
+            guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                Issue.record("Expected exact manifest quantization")
+                return
+            }
+            #expect(actual == exact)
+        }
+    }
+
+    @Test("JANG missing hidden-size hint disables semantic override")
+    func jangMissingHiddenSizeHintDisablesSemanticOverride() {
+        FocusedMLXTestSupport.withLock {
+            let base = "model.embed_tokens"
+            let weights: [String: MLXArray] = [
+                "\(base).weight": MLXArray.zeros([16, 384], dtype: .uint32),
+                "\(base).scales": MLXArray.zeros([16, 24], dtype: .float16),
+            ]
+            let declared = BaseConfiguration.PerLayerQuantization(
+                quantization: BaseConfiguration.Quantization(
+                    groupSize: 128, bits: 4, mode: .affine),
+                perLayerQuantization: [
+                    base: .quantize(BaseConfiguration.Quantization(
+                        groupSize: 64, bits: 8, mode: .affine))
+                ])
+
+            let inferred = JangLoader.inferPerLayerQuantization(
+                weights: weights,
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        blockSize: 128,
+                        bitWidthsUsed: [4, 8])),
+                validInDims: [1_536, 3_072],
+                declaredDefaultQuantization: declared.quantization,
+                declaredPerLayerQuantization: declared)
+
+            guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                Issue.record("Expected declared quantization without a hidden-size hint")
+                return
+            }
+            #expect(actual.bits == 8)
+            #expect(actual.groupSize == 64)
+        }
+    }
+
+    @Test("JANG lm_head uses uniquely realizable hidden width")
+    func jangLMHeadUsesUniquelyRealizableHiddenWidth() {
+        FocusedMLXTestSupport.withLock {
+            let base = "lm_head"
+            let weights: [String: MLXArray] = [
+                "\(base).weight": MLXArray.zeros([200_064, 384], dtype: .uint32),
+                "\(base).scales": MLXArray.zeros([200_064, 24], dtype: .float16),
+            ]
+            let stale = BaseConfiguration.PerLayerQuantization(
+                quantization: BaseConfiguration.Quantization(
+                    groupSize: 128, bits: 8, mode: .affine),
+                perLayerQuantization: [
+                    base: .quantize(BaseConfiguration.Quantization(
+                        groupSize: 64, bits: 8, mode: .affine))
+                ])
+
+            let inferred = JangLoader.inferPerLayerQuantization(
+                weights: weights,
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        blockSize: 128,
+                        bitWidthsUsed: [4, 8])),
+                hiddenSizeHint: 3_072,
+                validInDims: [1_536, 3_072],
+                declaredDefaultQuantization: stale.quantization,
+                declaredPerLayerQuantization: stale)
+
+            guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                Issue.record("Expected hidden-width lm_head quantization")
+                return
+            }
+            #expect(actual.bits == 4)
+            #expect(actual.groupSize == 128)
+        }
+    }
+
     @Test("shape-walk quantization uses Gemma4 PLE input width")
     func shapeWalkQuantizationUsesGemma4PLEInputWidth() {
         let projection = "language_model.model.layers.0.per_layer_projection"

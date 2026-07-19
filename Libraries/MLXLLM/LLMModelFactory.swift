@@ -1892,10 +1892,10 @@ public final class LLMModelFactory: ModelFactory {
             for: templateResolvedDir)
         async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
 
-        // When JANG, skip config.json's perLayerQuantization — JANG infers correct
-        // per-layer bits from tensor shapes. This avoids creating QuantizedLinear at
-        // the wrong bit width (which can't be re-quantized later).
-        // BUT: still pass `quantization` (the global config.json group_size /
+        // For JANG, pass config.json's per-layer metadata as declared evidence;
+        // loadWeights validates it against exact manifests, semantic widths, and
+        // tensor geometry before constructing QuantizedLinear modules.
+        // Also pass `quantization` (the global config.json group_size /
         // bits) so JangLoader.inferPerLayerQuantization gets the correct
         // `knownGroupSize` even when jang_config.json doesn't carry quant
         // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).

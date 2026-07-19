@@ -2181,29 +2181,31 @@ public struct JangLoader: Sendable {
             return nil
         }
 
-        func declaredQuantization(for basePath: String) -> BaseConfiguration.Quantization? {
-            func variants(_ key: String) -> [String] {
-                var out = [key]
-                if key.contains(".attn.") || key.hasSuffix(".attn") {
-                    out.append(key.replacingOccurrences(of: ".attn.", with: ".self_attn."))
-                    if key.hasSuffix(".attn") {
-                        out.append(String(key.dropLast(".attn".count)) + ".self_attn")
-                    }
+        func declaredPathVariants(_ key: String) -> [String] {
+            var out = [key]
+            if key.contains(".attn.") || key.hasSuffix(".attn") {
+                out.append(key.replacingOccurrences(of: ".attn.", with: ".self_attn."))
+                if key.hasSuffix(".attn") {
+                    out.append(String(key.dropLast(".attn".count)) + ".self_attn")
                 }
-                if key.hasPrefix("language_model.model.") {
-                    out.append(String(key.dropFirst("language_model.".count)))
-                } else if key.hasPrefix("language_model.") {
-                    out.append(String(key.dropFirst("language_model.".count)))
-                } else {
-                    out.append("model.\(key)")
-                    out.append("language_model.\(key)")
-                    out.append("language_model.model.\(key)")
-                }
-                return Array(Set(out))
             }
+            if key.hasPrefix("language_model.model.") {
+                out.append(String(key.dropFirst("language_model.".count)))
+            } else if key.hasPrefix("language_model.") {
+                out.append(String(key.dropFirst("language_model.".count)))
+            } else {
+                out.append("model.\(key)")
+                out.append("language_model.\(key)")
+                out.append("language_model.model.\(key)")
+            }
+            return Array(Set(out))
+        }
 
+        func declaredSpecificQuantization(
+            for basePath: String
+        ) -> BaseConfiguration.Quantization? {
             if let declaredPerLayerQuantization {
-                for key in variants(basePath) {
+                for key in declaredPathVariants(basePath) {
                     if let declared = declaredPerLayerQuantization.perLayerQuantization[key] {
                         switch declared {
                         case .quantize(let quantization):
@@ -2217,6 +2219,24 @@ public struct JangLoader: Sendable {
             if let roleBits = declaredMXTQRoleBits(for: basePath) {
                 return BaseConfiguration.Quantization(
                     groupSize: groupSize, bits: roleBits, mode: defaultMode)
+            }
+            return nil
+        }
+
+        func hasDeclaredSkip(for basePath: String) -> Bool {
+            guard let declaredPerLayerQuantization else { return false }
+            for key in declaredPathVariants(basePath) {
+                if case .skip? = declaredPerLayerQuantization.perLayerQuantization[key] {
+                    return true
+                }
+            }
+            return false
+        }
+
+        func declaredQuantization(for basePath: String) -> BaseConfiguration.Quantization? {
+            guard !hasDeclaredSkip(for: basePath) else { return nil }
+            if let declared = declaredSpecificQuantization(for: basePath) {
+                return declared
             }
             return declaredPerLayerQuantization?.quantization
                 ?? declaredDefaultQuantization
@@ -2271,10 +2291,11 @@ public struct JangLoader: Sendable {
             let numGroups = scalesArray.shape.last ?? 1
             let (bits, inferredGroupSize): (Int, Int)
 
-            let isHiddenAnchor =
-                basePath.hasSuffix("embed_tokens")
-                || basePath.hasSuffix("embed")
-                || basePath.hasSuffix("lm_head")
+            let isLanguageHiddenAnchor =
+                basePath == "embed_tokens"
+                || basePath.hasSuffix(".embed_tokens")
+                || basePath == "lm_head"
+                || basePath.hasSuffix(".lm_head")
             let isHiddenInputProjection =
                 basePath.hasSuffix(".linear_attn.in_proj_qkv")
                 || basePath.hasSuffix(".linear_attn.in_proj_z")
@@ -2345,17 +2366,65 @@ public struct JangLoader: Sendable {
                 return (first.bits, first.groupSize)
             }
 
-            // Trust the bundle's EXPLICIT declared per-module quant when it unpacks the
-            // real `.weight`/`.scales` to an inputDim that is a known model dimension.
+            func inferExactQuantization(
+                expectedInDim: Int
+            ) -> (bits: Int, groupSize: Int)? {
+                guard packedDim > 0, numGroups > 0, expectedInDim > 0 else {
+                    return nil
+                }
+                let packedBits = packedDim * 32
+                guard packedBits % expectedInDim == 0,
+                    expectedInDim % numGroups == 0
+                else {
+                    return nil
+                }
+                let bits = packedBits / expectedInDim
+                let inferredGroupSize = expectedInDim / numGroups
+                guard [2, 3, 4, 5, 6, 8].contains(bits),
+                    [32, 64, 128].contains(inferredGroupSize)
+                else {
+                    return nil
+                }
+                return (bits, inferredGroupSize)
+            }
+
+            // Exact manifests are authoritative. The language token embedding and
+            // lm_head are the only roles promoted ahead of a valid declaration: both
+            // consume hidden_size, and the packed geometry must realize that width
+            // exactly. Keep broader projection heuristics after path-specific metadata
+            // but before a generic top-level default.
+            // This avoids treating vision paths such as `visual.pos_embed` as language
+            // anchors and avoids falling back to an unrelated generic pair when an
+            // expected hidden width cannot be represented by the tensor shapes.
+            //
+            // Otherwise trust the bundle's EXPLICIT declared per-module quant when it
+            // unpacks the real `.weight`/`.scales` to a known model dimension.
             // On ambiguous packed widths (512 → bits ∈ {2,4,8}) the shape walk can pick
             // a different, WRONG bit width: Laguna-M.1 ships 4-bit dense MLP, the walk
             // re-stamped 8-bit, and the 4-bit weights dequantized to a degenerate (empty)
             // output that collapsed the forward. A self-consistent declaration whose
-            // inputDim ∈ validInDims is the author's verified intent. A genuinely stale
-            // config (claims 8-bit for 4-bit-packed) unpacks to a NON-model inputDim,
-            // fails this check, and still falls through to the shape walk.
+            // inputDim ∈ validInDims is the strongest available evidence for roles
+            // without a more specific tensor manifest or semantic width constraint.
             if let manifest = manifestQuantization(for: basePath) {
                 (bits, inferredGroupSize) = (manifest.bits, manifest.groupSize)
+            } else if isLanguageHiddenAnchor,
+                      let hiddenSize = hiddenSizeHint,
+                      let exact = inferExactQuantization(expectedInDim: hiddenSize)
+            {
+                (bits, inferredGroupSize) = exact
+            } else if let dq = declaredSpecificQuantization(for: basePath),
+               dq.bits > 0, numGroups > 0, (packedDim * 32) % dq.bits == 0,
+               case let declaredInputDim = (packedDim * 32) / dq.bits,
+               declaredInputDim % numGroups == 0,
+               declaredInputDim / numGroups == dq.groupSize,
+               validInDims.contains(declaredInputDim)
+            {
+                (bits, inferredGroupSize) = (dq.bits, dq.groupSize)
+            } else if isHiddenInputProjection,
+                      let hiddenSize = hiddenSizeHint,
+                      let exact = inferExactQuantization(expectedInDim: hiddenSize)
+            {
+                (bits, inferredGroupSize) = exact
             } else if let dq = declaredQuantization(for: basePath),
                dq.bits > 0, numGroups > 0, (packedDim * 32) % dq.bits == 0,
                case let declaredInputDim = (packedDim * 32) / dq.bits,
@@ -2364,15 +2433,6 @@ public struct JangLoader: Sendable {
                validInDims.contains(declaredInputDim)
             {
                 (bits, inferredGroupSize) = (dq.bits, dq.groupSize)
-            } else if (isHiddenAnchor || isHiddenInputProjection),
-               let hiddenSize = hiddenSizeHint, hiddenSize > 0
-            {
-                (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
-                    packedDim: packedDim,
-                    numGroups: numGroups,
-                    knownGroupSize: groupSize,
-                    bitWidthsUsed: bitWidthsUsed,
-                    expectedInDim: hiddenSize)
             } else if isMTPFusionFC,
                       let hiddenSize = hiddenSizeHint, hiddenSize > 0
             {
