@@ -2205,7 +2205,16 @@ public struct JangLoader: Sendable {
             for basePath: String
         ) -> BaseConfiguration.Quantization? {
             if let declaredPerLayerQuantization {
-                for key in declaredPathVariants(basePath) {
+                let variants = declaredPathVariants(basePath)
+                if variants.contains(where: {
+                    if case .skip? = declaredPerLayerQuantization.perLayerQuantization[$0] {
+                        return true
+                    }
+                    return false
+                }) {
+                    return nil
+                }
+                for key in variants {
                     if let declared = declaredPerLayerQuantization.perLayerQuantization[key] {
                         switch declared {
                         case .quantize(let quantization):

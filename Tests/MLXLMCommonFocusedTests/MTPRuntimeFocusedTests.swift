@@ -1464,22 +1464,17 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
-    @Test("JANG vision position embedding preserves valid declared quantization")
-    func jangVisionPositionEmbeddingPreservesDeclaredQuantization() {
+    @Test("JANG vision position embedding does not inherit language hidden width")
+    func jangVisionPositionEmbeddingDoesNotInheritLanguageHiddenWidth() {
         FocusedMLXTestSupport.withLock {
             let base = "visual.pos_embed"
             let weights: [String: MLXArray] = [
-                "\(base).weight": MLXArray.zeros([16, 256], dtype: .uint32),
-                "\(base).scales": MLXArray.zeros([16, 16], dtype: .float16),
-                "\(base).biases": MLXArray.zeros([16, 16], dtype: .float16),
+                "\(base).weight": MLXArray.zeros([16, 384], dtype: .uint32),
+                "\(base).scales": MLXArray.zeros([16, 24], dtype: .float16),
+                "\(base).biases": MLXArray.zeros([16, 24], dtype: .float16),
             ]
-            let declared = BaseConfiguration.PerLayerQuantization(
-                quantization: BaseConfiguration.Quantization(
-                    groupSize: 64, bits: 8, mode: .affine),
-                perLayerQuantization: [
-                    base: .quantize(BaseConfiguration.Quantization(
-                        groupSize: 128, bits: 4, mode: .affine))
-                ])
+            let declared = BaseConfiguration.Quantization(
+                groupSize: 64, bits: 8, mode: .affine)
 
             let inferred = JangLoader.inferPerLayerQuantization(
                 weights: weights,
@@ -1488,12 +1483,44 @@ struct MTPRuntimeFocusedTests {
                         blockSize: 64,
                         bitWidthsUsed: [4, 8])),
                 hiddenSizeHint: 3_072,
-                validInDims: [1_024, 2_048, 3_072],
+                validInDims: [1_536, 3_072],
+                declaredDefaultQuantization: declared)
+
+            guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                Issue.record("Expected generic vision position-embedding quantization")
+                return
+            }
+            #expect(actual.bits == 8)
+            #expect(actual.groupSize == 64)
+        }
+    }
+
+    @Test("JANG declared skip blocks generic metadata before specialized geometry")
+    func jangDeclaredSkipBlocksGenericMetadataBeforeSpecializedGeometry() {
+        FocusedMLXTestSupport.withLock {
+            let base = "model.layers.0.linear_attn.out_proj"
+            let weights: [String: MLXArray] = [
+                "\(base).weight": MLXArray.zeros([16, 384], dtype: .uint32),
+                "\(base).scales": MLXArray.zeros([16, 24], dtype: .float16),
+            ]
+            let declared = BaseConfiguration.PerLayerQuantization(
+                quantization: BaseConfiguration.Quantization(
+                    groupSize: 64, bits: 8, mode: .affine),
+                perLayerQuantization: [base: .skip])
+
+            let inferred = JangLoader.inferPerLayerQuantization(
+                weights: weights,
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        blockSize: 64,
+                        bitWidthsUsed: [4, 8])),
+                linearAttnValueDimHint: 3_072,
+                validInDims: [1_536, 3_072],
                 declaredDefaultQuantization: declared.quantization,
                 declaredPerLayerQuantization: declared)
 
             guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
-                Issue.record("Expected declared vision position-embedding quantization")
+                Issue.record("Expected specialized geometry after the declared skip")
                 return
             }
             #expect(actual.bits == 4)

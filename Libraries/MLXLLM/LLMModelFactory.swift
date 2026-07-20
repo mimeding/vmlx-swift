@@ -1903,10 +1903,9 @@ public final class LLMModelFactory: ModelFactory {
             modelDirectory: modelDirectory, model: model,
             quantization: jangConfig != nil ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
-            // loadWeights merges config.json's explicit per-layer dict on
-            // top of the shape walk to fix mis-inference of (bits, gs) pairs
-            // that share a packed shape (e.g., (4,64) ≡ (8,32)). Closes
-            // Cascade-2 JANG_4M / Nemotron-Omni MXFP4 first-prefill rmsNorm.
+            // loadWeights treats config.json's explicit per-layer dict as
+            // declared evidence, then validates it against exact manifests,
+            // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
             jangConfig: jangConfig,
             loadPreservedMTP: loadNativeMTP)
